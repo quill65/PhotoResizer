@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local model cache & sample outputs
+models/*.onnx
+!models/.gitkeep
+*.log
+
+# Environment secrets
+.env
+.env.local
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

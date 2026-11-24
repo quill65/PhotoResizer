@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "photo-resizer"
+version = "0.1.0"
+description = "Smart offline-first photo aspect-ratio cropper, scene analyzer, and tiered upsampler."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "httpx>=0.28.0",
+    "numpy>=2.0.0",
+    "onnxruntime>=1.19.0",
+    "opencv-python-headless>=4.10.0",
+    "pillow>=11.0.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "onnxruntime-directml>=1.19.0",
+]
+ai = [
+    "google-genai>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+photo-resizer = "photo_resizer.gui:main"
+photo-resizer-cli = "photo_resizer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/photo_resizer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
