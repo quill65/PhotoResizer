@@ -36,12 +36,24 @@ class CropDecision:
     score: float
     reason: str
     analysis: SceneAnalysis | None = None
+    was_smart_zoomed: bool = False
+    horizon_y_ratio: float | None = None
 
 
-def load_oriented_image(path: Path) -> tuple[Image.Image, bytes | None]:
-    """Load an image with EXIF auto-orientation applied and safe EXIF preserved."""
+def load_oriented_image_with_meta(path: Path) -> tuple[Image.Image, bytes | None, bool]:
+    """Load an image with EXIF auto-orientation applied, returning (image, exif, was_rotated)."""
+    was_transposed = False
     with Image.open(path) as img:
         raw_exif = img.info.get("exif")
+        if raw_exif:
+            try:
+                exif_check = Image.Exif()
+                exif_check.load(raw_exif)
+                orientation = exif_check.get(274, 1)
+                was_transposed = isinstance(orientation, int) and orientation not in (0, 1)
+            except Exception:
+                was_transposed = False
+
         oriented = ImageOps.exif_transpose(img)
         if oriented.mode not in ("RGB", "RGBA"):
             oriented = oriented.convert("RGB")
@@ -58,6 +70,12 @@ def load_oriented_image(path: Path) -> tuple[Image.Image, bytes | None]:
             cleaned_exif = exif_obj.tobytes()
         except Exception:
             cleaned_exif = None
+    return oriented, cleaned_exif, was_transposed
+
+
+def load_oriented_image(path: Path) -> tuple[Image.Image, bytes | None]:
+    """Load an image with EXIF auto-orientation applied and safe EXIF preserved."""
+    oriented, cleaned_exif, _ = load_oriented_image_with_meta(path)
     return oriented, cleaned_exif
 
 
@@ -276,15 +294,19 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
 
     # Build a concise human-readable explanation
     notes: list[str] = []
+    horizon_rel: float | None = None
     if analysis.faces:
         notes.append(f"{len(analysis.faces)} face(s) protected")
     if analysis.horizon.y_norm is not None and analysis.horizon.confidence >= 0.30:
-        rel_h = (analysis.horizon.y_norm * src_h - best_box.y) / max(1, best_box.height)
-        notes.append(f"horizon @ {rel_h:.0%} (conf {analysis.horizon.confidence:.2f})")
+        horizon_rel = (analysis.horizon.y_norm * src_h - best_box.y) / max(1, best_box.height)
+        notes.append(f"horizon @ {horizon_rel:.0%} (conf {analysis.horizon.confidence:.2f})")
     if not notes:
         notes.append(
             f"salient focus ({analysis.primary_center[0]:.0%}, {analysis.primary_center[1]:.0%})"
         )
+    was_smart_zoomed = best_box.width < max_w - 1 or best_box.height < max_h - 1
+    if was_smart_zoomed:
+        notes.append("smart zoom reframed")
     notes.append(
         f"cropped {src_w}x{src_h} -> {best_box.width}x{best_box.height} "
         f"@ ({best_box.x},{best_box.y})"
@@ -296,6 +318,8 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
         score=best_score,
         reason="; ".join(notes),
         analysis=analysis,
+        was_smart_zoomed=was_smart_zoomed,
+        horizon_y_ratio=horizon_rel,
     )
 
 

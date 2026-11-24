@@ -19,6 +19,7 @@ def test_save_and_reload_settings_round_trip(tmp_path: Path) -> None:
         custom_output_dir=r"C:\Photos\Out",
         ratio_preset="4:5 (Portrait Social)",
         custom_ratio="4:5",
+        orientation_mode="ai_outpaint",
         skip_existing=False,
         recursive=True,
         allow_smart_zoom=True,
@@ -27,6 +28,8 @@ def test_save_and_reload_settings_round_trip(tmp_path: Path) -> None:
         min_long_edge=2560,
         min_short_edge=1440,
         onnx_model_path=r"C:\models\realesr-general-x4v3.onnx",
+        save_log=True,
+        log_format="csv",
         window_geometry="900x700+100+80",
     )
 

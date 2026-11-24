@@ -11,6 +11,10 @@ from pathlib import Path
 from photo_resizer.config import ASPECT_RATIO_PRESETS
 
 VALID_ENHANCER_MODES: frozenset[str] = frozenset({"auto", "offline", "opencv", "onnx", "gemini"})
+VALID_LOG_FORMATS: frozenset[str] = frozenset({"txt", "csv", "json", "all"})
+VALID_ORIENTATION_MODES: frozenset[str] = frozenset(
+    {"crop", "match_orientation", "blur_fill", "ai_outpaint"}
+)
 
 
 @dataclass
@@ -26,6 +30,7 @@ class GuiSettings:
     custom_output_dir: str = ""
     ratio_preset: str = "16:9 (Widescreen)"
     custom_ratio: str = "16:9"
+    orientation_mode: str = "crop"
     skip_existing: bool = True
     recursive: bool = False
     allow_smart_zoom: bool = False
@@ -34,6 +39,8 @@ class GuiSettings:
     min_long_edge: int = 1920
     min_short_edge: int = 1080
     onnx_model_path: str = ""
+    save_log: bool = True
+    log_format: str = "txt"
     window_geometry: str = ""
 
 
@@ -88,6 +95,14 @@ def load_settings(path: Path | None = None) -> GuiSettings:
     if mode not in VALID_ENHANCER_MODES:
         mode = defaults.enhancer_mode
 
+    log_fmt = _coerce_str(raw.get("log_format"), defaults.log_format)
+    if log_fmt not in VALID_LOG_FORMATS:
+        log_fmt = defaults.log_format
+
+    orient_mode = _coerce_str(raw.get("orientation_mode"), defaults.orientation_mode)
+    if orient_mode not in VALID_ORIENTATION_MODES:
+        orient_mode = defaults.orientation_mode
+
     return GuiSettings(
         source_dir=_coerce_str(raw.get("source_dir"), defaults.source_dir),
         output_folder_name=(
@@ -96,6 +111,7 @@ def load_settings(path: Path | None = None) -> GuiSettings:
         custom_output_dir=_coerce_str(raw.get("custom_output_dir"), defaults.custom_output_dir),
         ratio_preset=preset,
         custom_ratio=_coerce_str(raw.get("custom_ratio"), defaults.custom_ratio) or "16:9",
+        orientation_mode=orient_mode,
         skip_existing=_coerce_bool(raw.get("skip_existing"), defaults.skip_existing),
         recursive=_coerce_bool(raw.get("recursive"), defaults.recursive),
         allow_smart_zoom=_coerce_bool(raw.get("allow_smart_zoom"), defaults.allow_smart_zoom),
@@ -104,6 +120,8 @@ def load_settings(path: Path | None = None) -> GuiSettings:
         min_long_edge=_coerce_int(raw.get("min_long_edge"), defaults.min_long_edge, 320, 8192),
         min_short_edge=_coerce_int(raw.get("min_short_edge"), defaults.min_short_edge, 240, 8192),
         onnx_model_path=_coerce_str(raw.get("onnx_model_path"), defaults.onnx_model_path),
+        save_log=_coerce_bool(raw.get("save_log"), defaults.save_log),
+        log_format=log_fmt,
         window_geometry=_coerce_str(raw.get("window_geometry"), defaults.window_geometry),
     )
 

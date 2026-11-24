@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Literal
 
 EnhancerMode = Literal["auto", "offline", "opencv", "onnx", "gemini"]
+LogFormat = Literal["txt", "csv", "json", "all"]
+OrientationMode = Literal["crop", "match_orientation", "blur_fill", "ai_outpaint"]
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -86,6 +88,7 @@ class CropConfig:
 
     aspect_ratio: AspectRatio = field(default_factory=lambda: AspectRatio(16, 9, "16:9"))
     aspect_tolerance: float = 0.01
+    orientation_mode: OrientationMode = "crop"
     allow_smart_zoom: bool = False
     min_crop_fraction: float = 0.85
     candidate_steps: int = 41
@@ -128,6 +131,9 @@ class ProcessConfig:
     overwrite: bool = False
     recursive: bool = False
     write_report: bool = True
+    save_log: bool = True
+    log_format: LogFormat = "txt"
+    log_file: Path | None = None
 
     def resolved_output_dir(self) -> Path:
         if self.output_dir is not None:

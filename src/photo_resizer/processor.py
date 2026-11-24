@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from PIL import Image
 
-from photo_resizer.config import SUPPORTED_EXTENSIONS, ProcessConfig
-from photo_resizer.cropper import crop_pil_image, load_oriented_image
+from photo_resizer.config import SUPPORTED_EXTENSIONS, AspectRatio, ProcessConfig
+from photo_resizer.correction_log import save_batch_logs
+from photo_resizer.cropper import crop_pil_image, load_oriented_image_with_meta
 from photo_resizer.enhancer import TieredEnhancer
+from photo_resizer.outpainter import (
+    expand_canvas_ai_outpaint,
+    expand_canvas_blur_fill,
+    is_orientation_mismatch,
+)
 
 StatusType = Literal["processed", "skipped", "failed"]
 
@@ -29,9 +34,16 @@ class ImageResult:
     original_size: tuple[int, int] | None = None
     cropped_size: tuple[int, int] | None = None
     final_size: tuple[int, int] | None = None
+    crop_box: tuple[int, int, int, int] | None = None
     was_cropped: bool = False
     was_enhanced: bool = False
     enhancer_used: str = "none"
+    upscale_factor: float = 1.0
+    change_types: list[str] = field(default_factory=list)
+    tools_used: list[str] = field(default_factory=list)
+    faces_detected: int = 0
+    horizon_y_ratio: float | None = None
+    processed_at_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     message: str = ""
 
     def to_json_dict(self) -> dict[str, object]:
@@ -53,6 +65,7 @@ class BatchSummary:
     failed: int = 0
     cancelled: bool = False
     results: list[ImageResult] = field(default_factory=list)
+    saved_log_paths: list[Path] = field(default_factory=list)
 
 
 ProgressCallback = Callable[[int, int, ImageResult], None]
@@ -158,6 +171,7 @@ def process_folder(
                 source_path=src_path,
                 output_path=out_path,
                 status="skipped",
+                change_types=["skipped_already_corrected"],
                 message="Already corrected (present in output folder)",
             )
             summary.skipped += 1
@@ -167,15 +181,88 @@ def process_folder(
             continue
 
         try:
-            oriented, exif_bytes = load_oriented_image(src_path)
+            oriented, exif_bytes, was_exif_rotated = load_oriented_image_with_meta(src_path)
             orig_size = oriented.size
 
-            cropped_img, crop_decision = crop_pil_image(oriented, config.crop)
-            cropped_size = cropped_img.size
+            change_types: list[str] = []
+            tools_used: list[str] = []
+            if was_exif_rotated:
+                change_types.append("exif_auto_oriented")
+                tools_used.append("Pillow (exif_transpose)")
+
+            target_ratio_obj = config.crop.aspect_ratio
+            orient_mode = config.crop.orientation_mode
+            mismatched = is_orientation_mismatch(
+                orig_size[0], orig_size[1], target_ratio_obj.value
+            )
+
+            was_cropped = False
+            crop_box_tuple: tuple[int, int, int, int] | None = None
+            faces_count = 0
+            horizon_rel: float | None = None
+            effective_ratio_val = target_ratio_obj.value
+            framing_note = ""
+
+            if mismatched and orient_mode == "blur_fill":
+                expanded = expand_canvas_blur_fill(oriented, target_ratio_obj.value)
+                framed_img = expanded.image
+                change_types.append("blurred_backdrop_fill")
+                tools_used.append(expanded.tool_detail)
+                framing_note = expanded.note
+            elif mismatched and orient_mode == "ai_outpaint":
+                expanded = expand_canvas_ai_outpaint(
+                    oriented, target_ratio_obj.value, config.enhance
+                )
+                framed_img = expanded.image
+                if expanded.method == "ai_outpaint":
+                    change_types.append("ai_outpaint_background")
+                else:
+                    change_types.append("blurred_backdrop_fill")
+                tools_used.append(expanded.tool_detail)
+                framing_note = expanded.note
+            else:
+                effective_crop_cfg = config.crop
+                if mismatched and orient_mode == "match_orientation":
+                    flipped = AspectRatio(target_ratio_obj.height, target_ratio_obj.width)
+                    effective_crop_cfg = replace(config.crop, aspect_ratio=flipped)
+                    effective_ratio_val = flipped.value
+                    change_types.append("orientation_matched")
+
+                framed_img, crop_decision = crop_pil_image(oriented, effective_crop_cfg)
+                was_cropped = crop_decision.was_cropped
+                box = crop_decision.box
+                crop_box_tuple = (box.x, box.y, box.width, box.height)
+                faces_count = (
+                    len(crop_decision.analysis.faces)
+                    if crop_decision.analysis is not None
+                    else 0
+                )
+                horizon_rel = crop_decision.horizon_y_ratio
+                framing_note = crop_decision.reason
+                if mismatched and orient_mode == "match_orientation":
+                    framing_note = (
+                        f"matched orientation ({effective_crop_cfg.aspect_ratio.display_name}); "
+                        f"{framing_note}"
+                    )
+
+                if crop_decision.was_cropped:
+                    change_types.append("aspect_ratio_crop")
+                    if crop_decision.was_smart_zoomed:
+                        change_types.append("smart_zoom_reframe")
+                    signals: list[str] = []
+                    if faces_count > 0:
+                        signals.append("haar_faces")
+                    signals.append("spectral+lab_saliency")
+                    if horizon_rel is not None:
+                        signals.append("hough_horizon")
+                    tools_used.append(f"OpenCV Scene Analyzer ({', '.join(signals)})")
+                    tools_used.append("Pillow (crop)")
+
+            cropped_size = framed_img.size
 
             enhance_result = enhancer.enhance_if_needed(
-                cropped_img,
-                target_ratio=config.crop.aspect_ratio.value,
+                framed_img,
+                target_ratio=effective_ratio_val,
             )
             final_img = enhance_result.image
             final_size = final_img.size
@@ -187,7 +274,15 @@ def process_folder(
                 exif_bytes=exif_bytes,
             )
 
-            msg_parts = [crop_decision.reason]
+            if enhance_result.was_enhanced:
+                change_types.append("upsample_and_enhance")
+                tools_used.append(enhance_result.tool_detail or enhance_result.backend)
+
+            if not change_types or change_types == ["orientation_matched"]:
+                change_types.append("copied_unchanged")
+                tools_used.append("Pillow (save)")
+
+            msg_parts = [framing_note]
             if enhance_result.was_enhanced:
                 msg_parts.append(enhance_result.note)
             elif config.enhance.enabled:
@@ -200,9 +295,15 @@ def process_folder(
                 original_size=orig_size,
                 cropped_size=cropped_size,
                 final_size=final_size,
-                was_cropped=crop_decision.was_cropped,
+                crop_box=crop_box_tuple,
+                was_cropped=was_cropped,
                 was_enhanced=enhance_result.was_enhanced,
                 enhancer_used=enhance_result.backend,
+                upscale_factor=enhance_result.scale_factor,
+                change_types=change_types,
+                tools_used=tools_used,
+                faces_detected=faces_count,
+                horizon_y_ratio=horizon_rel,
                 message=" | ".join(msg_parts),
             )
             summary.processed += 1
@@ -211,6 +312,7 @@ def process_folder(
                 source_path=src_path,
                 output_path=out_path,
                 status="failed",
+                change_types=["failed"],
                 message=f"Error: {exc}",
             )
             summary.failed += 1
@@ -219,27 +321,5 @@ def process_folder(
         if on_progress is not None:
             on_progress(idx, len(image_paths), res)
 
-    if config.write_report:
-        _write_report(summary, config)
-
+    summary.saved_log_paths = save_batch_logs(summary, config)
     return summary
-
-
-def _write_report(summary: BatchSummary, config: ProcessConfig) -> None:
-    report_path = summary.output_dir / "processing_report.json"
-    payload = {
-        "timestamp_utc": datetime.now(UTC).isoformat(),
-        "source_dir": str(summary.source_dir),
-        "output_dir": str(summary.output_dir),
-        "aspect_ratio": config.crop.aspect_ratio.display_name,
-        "enhancer_mode": config.enhance.mode,
-        "min_long_edge": config.enhance.min_long_edge,
-        "min_short_edge": config.enhance.min_short_edge,
-        "total_found": summary.total_found,
-        "processed": summary.processed,
-        "skipped": summary.skipped,
-        "failed": summary.failed,
-        "cancelled": summary.cancelled,
-        "results": [r.to_json_dict() for r in summary.results],
-    }
-    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

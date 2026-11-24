@@ -17,8 +17,17 @@ from photo_resizer.config import (
     EnhanceConfig,
     ProcessConfig,
 )
+from photo_resizer.correction_log import export_log_to_path
 from photo_resizer.processor import BatchSummary, ImageResult, process_folder
 from photo_resizer.settings_store import GuiSettings, load_settings, save_settings
+
+ORIENTATION_MODE_LABELS: dict[str, str] = {
+    "Crop to target ratio": "crop",
+    "Match photo orientation (flip ratio)": "match_orientation",
+    "Blurred backdrop fill (offline)": "blur_fill",
+    "AI outpaint background (Gemini)": "ai_outpaint",
+}
+ORIENTATION_CODE_TO_LABEL: dict[str, str] = {v: k for k, v in ORIENTATION_MODE_LABELS.items()}
 
 HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
@@ -74,6 +83,20 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "tighter 85%-scale crops shifted in both X and Y, picking a zoomed-in crop only "
                 "if it meaningfully improves composition.",
             ),
+            (
+                "Mismatched Orientation (Portrait <-> Landscape)",
+                "Controls what happens when a portrait photo is processed with a landscape target "
+                "ratio (e.g. 16:9), or vice versa:\n"
+                "  • Crop to target ratio: Strictly crops every photo to the target ratio.\n"
+                "  • Match photo orientation: Automatically flips the target ratio to match each "
+                "photo (e.g. 16:9 becomes 9:16 for portraits, 3:2 becomes 2:3).\n"
+                "  • Blurred backdrop fill (offline): Keeps the full photo intact inside the "
+                "target frame over a softly blurred, color-matched backdrop (100% offline).\n"
+                "  • AI outpaint background (Gemini): Uses Gemini (via GEMINI_API_KEY) to "
+                "generate natural matching scenery on the empty sides, then feather-composites "
+                "your untouched original photo back in so faces and details stay 100% faithful. "
+                "Falls back to blurred backdrop fill automatically if offline or no key is set.",
+            ),
         ),
     ),
     (
@@ -116,6 +139,13 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "Local ONNX Model / Gemini API Key",
                 "Optional overrides. Leave ONNX blank to auto-detect from models/ or cache. "
                 "Gemini API Key is only ever used when Enhancer Tier is set to 'gemini'.",
+            ),
+            (
+                "Save Corrections Log / Save Log As...",
+                "When checked, automatically saves a detailed per-image corrections log inside "
+                "the output folder in your chosen format (txt, csv, json, or all) recording "
+                "original/cropped/final sizes, exact crop box, change types, and tools used. "
+                "Use 'Save Log As...' after a run to export the log to any folder.",
             ),
         ),
     ),
@@ -188,6 +218,8 @@ class PhotoResizerApp:
         self._worker: threading.Thread | None = None
         self._cancel_event = threading.Event()
         self._last_output_dir: Path | None = None
+        self._last_summary: BatchSummary | None = None
+        self._last_config: ProcessConfig | None = None
         self._help_window: tk.Toplevel | None = None
 
         # State variables initialized from last saved settings
@@ -196,6 +228,10 @@ class PhotoResizerApp:
         self.custom_output_var = tk.StringVar(value=saved.custom_output_dir)
         self.ratio_preset_var = tk.StringVar(value=saved.ratio_preset)
         self.custom_ratio_var = tk.StringVar(value=saved.custom_ratio)
+        orient_label = ORIENTATION_CODE_TO_LABEL.get(
+            saved.orientation_mode, "Crop to target ratio"
+        )
+        self.orientation_mode_var = tk.StringVar(value=orient_label)
 
         self.skip_existing_var = tk.BooleanVar(value=saved.skip_existing)
         self.recursive_var = tk.BooleanVar(value=saved.recursive)
@@ -207,6 +243,8 @@ class PhotoResizerApp:
         self.min_short_var = tk.IntVar(value=saved.min_short_edge)
         self.onnx_model_var = tk.StringVar(value=saved.onnx_model_path)
         self.gemini_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
+        self.save_log_var = tk.BooleanVar(value=saved.save_log)
+        self.log_format_var = tk.StringVar(value=saved.log_format)
 
         self.status_var = tk.StringVar(value="Select an image folder to begin.")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -284,8 +322,19 @@ class PhotoResizerApp:
         )
         self.custom_ratio_entry.grid(row=0, column=3, sticky=tk.W, pady=4)
 
+        ttk.Label(crop_frame, text="Mismatched Orientation:").grid(
+            row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4
+        )
+        ttk.Combobox(
+            crop_frame,
+            textvariable=self.orientation_mode_var,
+            values=list(ORIENTATION_MODE_LABELS.keys()),
+            state="readonly",
+            width=34,
+        ).grid(row=1, column=1, columnspan=3, sticky=tk.W, pady=4)
+
         opts_row = ttk.Frame(crop_frame)
-        opts_row.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
+        opts_row.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
         ttk.Checkbutton(
             opts_row,
             text="Skip images already in corrected folder",
@@ -361,9 +410,25 @@ class PhotoResizerApp:
         ttk.Entry(enh_frame, textvariable=self.gemini_key_var, show="*").grid(
             row=4, column=1, columnspan=2, sticky=tk.EW, pady=4
         )
-        ttk.Label(enh_frame, text="(Only used when Tier = gemini)").grid(
+        ttk.Label(enh_frame, text="(Used for Gemini tier or AI outpaint)").grid(
             row=4, column=3, sticky=tk.W, padx=(8, 0), pady=4
         )
+
+        log_opt_row = ttk.Frame(enh_frame)
+        log_opt_row.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(
+            log_opt_row,
+            text="Save detailed corrections log in output folder",
+            variable=self.save_log_var,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(log_opt_row, text="Format:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            log_opt_row,
+            textvariable=self.log_format_var,
+            values=["txt", "csv", "json", "all"],
+            state="readonly",
+            width=8,
+        ).pack(side=tk.LEFT)
 
         # 4. Controls & Progress
         ctrl_row = ttk.Frame(main)
@@ -385,6 +450,14 @@ class PhotoResizerApp:
             command=self._show_help,
         )
         self.help_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        self.save_log_btn = ttk.Button(
+            ctrl_row,
+            text="Save Log As...",
+            command=self._save_log_as,
+            state=tk.DISABLED,
+        )
+        self.save_log_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
         self.open_out_btn = ttk.Button(
             ctrl_row,
@@ -463,6 +536,9 @@ class PhotoResizerApp:
             custom_output_dir=self.custom_output_var.get().strip(),
             ratio_preset=self.ratio_preset_var.get(),
             custom_ratio=self.custom_ratio_var.get().strip() or "16:9",
+            orientation_mode=ORIENTATION_MODE_LABELS.get(
+                self.orientation_mode_var.get(), "crop"
+            ),
             skip_existing=self.skip_existing_var.get(),
             recursive=self.recursive_var.get(),
             allow_smart_zoom=self.smart_zoom_var.get(),
@@ -471,6 +547,8 @@ class PhotoResizerApp:
             min_long_edge=min_long,
             min_short_edge=min_short,
             onnx_model_path=self.onnx_model_var.get().strip(),
+            save_log=self.save_log_var.get(),
+            log_format=self.log_format_var.get(),
             window_geometry=self.root.winfo_geometry(),
         )
 
@@ -528,6 +606,9 @@ class PhotoResizerApp:
             output_folder_name=out_name,
             crop=CropConfig(
                 aspect_ratio=ratio,
+                orientation_mode=ORIENTATION_MODE_LABELS.get(
+                    self.orientation_mode_var.get(), "crop"
+                ),  # type: ignore[arg-type]
                 allow_smart_zoom=self.smart_zoom_var.get(),
             ),
             enhance=EnhanceConfig(
@@ -540,6 +621,8 @@ class PhotoResizerApp:
             ),
             overwrite=not self.skip_existing_var.get(),
             recursive=self.recursive_var.get(),
+            save_log=self.save_log_var.get(),
+            log_format=self.log_format_var.get(),  # type: ignore[arg-type]
         )
 
     def _start_processing(self) -> None:
@@ -550,12 +633,15 @@ class PhotoResizerApp:
         self._save_current_settings()
         self._cancel_event.clear()
         self._last_output_dir = config.resolved_output_dir()
+        self._last_config = config
+        self._last_summary = None
         self._clear_log()
         self.progress_var.set(0.0)
         self.status_var.set("Scanning folder...")
         self.run_btn.configure(state=tk.DISABLED)
         self.cancel_btn.configure(state=tk.NORMAL)
         self.open_out_btn.configure(state=tk.DISABLED)
+        self.save_log_btn.configure(state=tk.DISABLED)
 
         self._append_log(f"Source : {config.source_dir}")
         self._append_log(f"Output : {self._last_output_dir}")
@@ -593,6 +679,9 @@ class PhotoResizerApp:
     def _on_finished(self, summary: BatchSummary) -> None:
         self.run_btn.configure(state=tk.NORMAL)
         self.cancel_btn.configure(state=tk.DISABLED)
+        self._last_summary = summary
+        if summary.results:
+            self.save_log_btn.configure(state=tk.NORMAL)
         if summary.output_dir.exists():
             self.open_out_btn.configure(state=tk.NORMAL)
             self._last_output_dir = summary.output_dir
@@ -606,6 +695,10 @@ class PhotoResizerApp:
         self.status_var.set(msg)
         self._append_log("-" * 70)
         self._append_log(msg)
+        if summary.saved_log_paths:
+            self._append_log(
+                "Saved log(s): " + ", ".join(str(p) for p in summary.saved_log_paths)
+            )
         if not summary.cancelled:
             self.progress_var.set(100.0)
 
@@ -620,6 +713,36 @@ class PhotoResizerApp:
         self._cancel_event.set()
         self.status_var.set("Cancelling after current image...")
         self.cancel_btn.configure(state=tk.DISABLED)
+
+    def _save_log_as(self) -> None:
+        if self._last_summary is None or self._last_config is None:
+            return
+        initial_dir = (
+            str(self._last_output_dir)
+            if self._last_output_dir and self._last_output_dir.is_dir()
+            else ""
+        )
+        selected = filedialog.asksaveasfilename(
+            title="Save Corrections Log As",
+            initialdir=initial_dir or None,
+            initialfile="corrections_log.txt",
+            defaultextension=".txt",
+            filetypes=[
+                ("Text Log (*.txt)", "*.txt"),
+                ("CSV Spreadsheet (*.csv)", "*.csv"),
+                ("JSON Report (*.json)", "*.json"),
+            ],
+        )
+        if not selected:
+            return
+        try:
+            saved_path = export_log_to_path(
+                self._last_summary, self._last_config, Path(selected), append=False
+            )
+            self._append_log(f"Exported log to: {saved_path}")
+            self.status_var.set(f"Log saved to {saved_path.name}")
+        except Exception as exc:
+            messagebox.showerror("Save Log Error", f"Failed to save log:\n{exc}")
 
     def _open_output_folder(self) -> None:
         if self._last_output_dir is None or not self._last_output_dir.exists():

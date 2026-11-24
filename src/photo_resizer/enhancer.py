@@ -44,6 +44,7 @@ class EnhanceResult:
     backend: str
     scale_factor: float
     note: str
+    tool_detail: str = ""
 
 
 class ImageEnhancer(Protocol):
@@ -491,6 +492,20 @@ class TieredEnhancer:
             model=config.gemini_model,
         )
 
+    def _describe_backend_tool(self, backend: ImageEnhancer) -> str:
+        if isinstance(backend, OpenCVEnhancer):
+            return "OpenCV (progressive Lanczos4 + bilateral denoise + LAB CLAHE/unsharp)"
+        if isinstance(backend, OnnxSuperResEnhancer):
+            model_name = (
+                backend.loaded_model_path.name
+                if backend.loaded_model_path is not None
+                else "local-onnx"
+            )
+            return f"ONNX Runtime ({model_name}, {backend.active_provider})"
+        if isinstance(backend, GeminiEnhancer):
+            return f"Gemini AI ({self._config.gemini_model})"
+        return backend.name
+
     def enhance_if_needed(
         self,
         image: Image.Image,
@@ -549,6 +564,7 @@ class TieredEnhancer:
                     backend=backend.name,
                     scale_factor=scale,
                     note=detail,
+                    tool_detail=self._describe_backend_tool(backend),
                 )
             except ModelUnavailableError as exc:
                 fallback_notes.append(f"{backend.name} skipped: {exc}")

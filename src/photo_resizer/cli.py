@@ -103,6 +103,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow gentle zoom-in reframing (up to 15%) if it improves composition.",
     )
     parser.add_argument(
+        "--orientation-mode",
+        choices=["crop", "match_orientation", "blur_fill", "ai_outpaint"],
+        default="crop",
+        help=(
+            "How to handle portrait <-> landscape orientation mismatches: "
+            "crop, match_orientation, blur_fill, or ai_outpaint (default: crop)."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Re-process images even if they already exist in the corrected folder.",
@@ -117,6 +126,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=94,
         help="Output JPEG/WebP quality 1-100 (default: 94).",
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=["txt", "csv", "json", "all"],
+        default="txt",
+        help="Corrections log format saved in the output folder (default: txt).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Explicit path for saving the corrections log (.txt, .csv, or .json).",
+    )
+    parser.add_argument(
+        "--no-save-log",
+        action="store_true",
+        help="Do not save a corrections log file in the output folder.",
     )
     return parser
 
@@ -144,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         output_folder_name=args.output_name,
         crop=CropConfig(
             aspect_ratio=ratio,
+            orientation_mode=args.orientation_mode,
             allow_smart_zoom=args.allow_smart_zoom,
         ),
         enhance=EnhanceConfig(
@@ -157,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         jpeg_quality=args.quality,
         overwrite=args.overwrite,
         recursive=args.recursive,
+        save_log=not args.no_save_log,
+        log_format=args.log_format,
+        log_file=args.log_file,
     )
 
     out_dir = config.resolved_output_dir()
@@ -179,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         f"Done. Found: {summary.total_found} | Processed: {summary.processed} "
         f"| Skipped: {summary.skipped} | Failed: {summary.failed}"
     )
+    if summary.saved_log_paths:
+        logs_str = ", ".join(str(p) for p in summary.saved_log_paths)
+        print(f"Saved log(s)  : {logs_str}")
     return 1 if summary.failed > 0 else 0
 
 
