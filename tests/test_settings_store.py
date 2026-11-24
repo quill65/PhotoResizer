@@ -28,6 +28,7 @@ def test_save_and_reload_settings_round_trip(tmp_path: Path) -> None:
         min_long_edge=2560,
         min_short_edge=1440,
         onnx_model_path=r"C:\models\realesr-general-x4v3.onnx",
+        gemini_api_key="AIzaSyTestExampleKey12345",
         save_log=True,
         log_format="csv",
         window_geometry="900x700+100+80",
@@ -36,9 +37,9 @@ def test_save_and_reload_settings_round_trip(tmp_path: Path) -> None:
     save_settings(original, cfg_file)
     assert cfg_file.is_file()
 
-    # Ensure no secret/API key field is written to plaintext JSON
+    # On Windows, API key is encrypted via DPAPI (never written in plaintext)
     raw_text = cfg_file.read_text(encoding="utf-8")
-    assert "api_key" not in raw_text.lower()
+    assert "AIzaSyTestExampleKey12345" not in raw_text
 
     reloaded = load_settings(cfg_file)
     assert reloaded == original

@@ -11,6 +11,16 @@ from typing import Literal
 EnhancerMode = Literal["auto", "offline", "opencv", "onnx", "gemini"]
 LogFormat = Literal["txt", "csv", "json", "all"]
 OrientationMode = Literal["crop", "match_orientation", "blur_fill", "ai_outpaint"]
+FramingStyle = Literal["center_subject", "rule_of_thirds"]
+
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-nano-banana-2.1"
+GEMINI_IMAGE_MODEL_PRESETS: tuple[str, ...] = (
+    "gemini-nano-banana-2.1",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image",
+    "gemini-2.5-flash-image",
+)
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -89,10 +99,15 @@ class CropConfig:
     aspect_ratio: AspectRatio = field(default_factory=lambda: AspectRatio(16, 9, "16:9"))
     aspect_tolerance: float = 0.01
     orientation_mode: OrientationMode = "crop"
+    framing_style: FramingStyle = "center_subject"
+    outpaint_on_clip: bool = True
+    max_subject_clip_fraction: float = 0.03
     allow_smart_zoom: bool = False
     min_crop_fraction: float = 0.85
     candidate_steps: int = 41
     analysis_max_dim: int = 640
+    use_neural_detector: bool = True
+    auto_download_detectors: bool = True
 
 
 @dataclass
@@ -110,7 +125,7 @@ class EnhanceConfig:
     onnx_tile_size: int = 512
     onnx_tile_overlap: int = 32
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash-image"
+    gemini_model: str = DEFAULT_GEMINI_IMAGE_MODEL
     gemini_extreme_threshold: float = 2.5
     use_gemini_for_extreme_in_auto: bool = False
 

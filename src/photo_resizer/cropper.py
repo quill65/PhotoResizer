@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from photo_resizer.analyzer import Box, SceneAnalysis, analyze_scene
-from photo_resizer.config import CropConfig
+from photo_resizer.config import CropConfig, FramingStyle
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,8 @@ class CropDecision:
     analysis: SceneAnalysis | None = None
     was_smart_zoomed: bool = False
     horizon_y_ratio: float | None = None
+    subject_clipped_fraction: float = 0.0
+    would_clip_subject: bool = False
 
 
 def load_oriented_image_with_meta(path: Path) -> tuple[Image.Image, bytes | None, bool]:
@@ -110,8 +112,10 @@ def _score_candidate(
     total_saliency: float,
     img_w: int,
     img_h: int,
+    framing_style: FramingStyle = "center_subject",
 ) -> float:
     """Score a candidate normalized crop box for visual composition quality."""
+    del img_w, img_h
     proxy_w, proxy_h = analysis.proxy_size
     px1 = int(round(cand.x * proxy_w))
     py1 = int(round(cand.y * proxy_h))
@@ -122,21 +126,29 @@ def _score_candidate(
     captured = _rect_sum(integral, px1, py1, px2, py2)
     saliency_score = captured / max(total_saliency, 1e-6)
 
-    # 2. Face & headroom protection (heavily penalize clipping faces or top of heads)
-    face_penalty = 0.0
+    # 2. Animal, face, & headroom protection (strictly avoid clipping any part of a subject)
+    subject_clip_penalty = 0.0
+    for animal in analysis.animal_boxes:
+        inside = animal.fraction_inside(cand)
+        if inside < 0.999:
+            subject_clip_penalty += 6.5 * (1.0 - inside)
+    for margin in analysis.animal_margin_boxes:
+        inside = margin.fraction_inside(cand)
+        if inside < 0.999:
+            subject_clip_penalty += 2.0 * (1.0 - inside)
+
     for face in analysis.faces:
         inside = face.fraction_inside(cand)
         if inside < 0.999:
-            face_penalty += 4.5 * (1.0 - inside)
+            subject_clip_penalty += 4.5 * (1.0 - inside)
     for headroom in analysis.headroom_boxes:
         inside = headroom.fraction_inside(cand)
         if inside < 0.999:
-            face_penalty += 1.6 * (1.0 - inside)
+            subject_clip_penalty += 1.6 * (1.0 - inside)
 
     # 3. Subject edge-slicing penalty: penalize cuts passing through dense saliency
     border_penalty = 0.0
     strip = max(2, int(round(min(proxy_w, proxy_h) * 0.025)))
-    # Check each edge that actually cuts into the image (not touching outer frame)
     if cand.x > 0.005:
         cut_band = _rect_sum(integral, px1 - strip, py1, px1 + strip, py2)
         cut_area = max(1, (min(proxy_w, px1 + strip) - max(0, px1 - strip)) * max(1, py2 - py1))
@@ -154,76 +166,136 @@ def _score_candidate(
         cut_area = max(1, max(1, px2 - px1) * (min(proxy_h, py2 + strip) - max(0, py2 - strip)))
         border_penalty += (cut_band / cut_area) * 0.9
 
-    # Also penalize clipping primary subject box if no faces were detected
-    if not analysis.faces and analysis.subject_box is not None:
+    # Protect primary foreground subject box (covers animals, flowers, tails, petals)
+    if analysis.subject_box is not None:
         subj_inside = analysis.subject_box.fraction_inside(cand)
-        if subj_inside < 0.98:
-            border_penalty += 0.9 * (1.0 - subj_inside)
+        if subj_inside < 0.995:
+            weight = 4.2 if analysis.has_strong_subject else 1.4
+            subject_clip_penalty += weight * (1.0 - subj_inside)
 
-    # 4. Horizon placement (Rule of Thirds)
+    # 4. Horizon placement (Rule of Thirds, mainly for landscapes without a dominant close subject)
     horizon_score = 0.0
     h_est = analysis.horizon
     if h_est.y_norm is not None and h_est.confidence >= 0.30 and cand.h > 0:
         rel_h = (h_est.y_norm - cand.y) / cand.h
         if 0.12 <= rel_h <= 0.88:
             if h_est.sky_interest > h_est.ground_interest * 1.15:
-                # Dramatic sky -> favor lower third (2/3 from top)
                 dist_pref = abs(rel_h - 0.667)
                 dist_alt = abs(rel_h - 0.333)
                 third_score = max(1.0 - dist_pref * 3.0, 0.75 * (1.0 - dist_alt * 3.0), 0.0)
             elif h_est.ground_interest > h_est.sky_interest * 1.15:
-                # Rich foreground -> favor upper third (1/3 from top)
                 dist_pref = abs(rel_h - 0.333)
                 dist_alt = abs(rel_h - 0.667)
                 third_score = max(1.0 - dist_pref * 3.0, 0.75 * (1.0 - dist_alt * 3.0), 0.0)
             else:
                 dist = min(abs(rel_h - 0.333), abs(rel_h - 0.667))
                 third_score = max(0.0, 1.0 - dist * 3.0)
-            # Gentle penalty if horizon is dead-center
             center_pen = max(0.0, 0.15 - abs(rel_h - 0.5)) * 0.8
             horizon_score = h_est.confidence * (0.55 * third_score - center_pen)
         else:
-            # Horizon falls awkwardly right on or outside the crop edge
             horizon_score = -0.35 * h_est.confidence
 
-    # 5. Composition & Rule-of-Thirds alignment
+    # 5. Subject Framing: strongly center animals/subjects or align on rule of thirds
     composition_score = 0.0
-    if analysis.faces:
-        # Eyes/faces look most natural near the upper-third line (~0.35)
+    scx, scy = analysis.primary_center
+    rel_sx = (scx - cand.x) / max(cand.w, 1e-6)
+    rel_sy = (scy - cand.y) / max(cand.h, 1e-6)
+    subject_in_frame = 0.0 <= rel_sx <= 1.0 and 0.0 <= rel_sy <= 1.0
+
+    if analysis.faces and not analysis.animal_boxes:
         avg_face_cy = sum(f.cy for f in analysis.faces) / len(analysis.faces)
         avg_face_cx = sum(f.cx for f in analysis.faces) / len(analysis.faces)
         rel_fy = (avg_face_cy - cand.y) / max(cand.h, 1e-6)
         rel_fx = (avg_face_cx - cand.x) / max(cand.w, 1e-6)
-        eye_line_score = max(0.0, 1.0 - abs(rel_fy - 0.35) * 2.2)
-        fx_dist = min(abs(rel_fx - 0.5), abs(rel_fx - 0.333), abs(rel_fx - 0.667))
-        horiz_balance = max(0.0, 1.0 - fx_dist * 2.5)
-        composition_score = 0.35 * eye_line_score + 0.15 * horiz_balance
-    else:
-        # Subject center-of-mass proximity to rule-of-thirds power lines
-        scx, scy = analysis.primary_center
-        rel_sx = (scx - cand.x) / max(cand.w, 1e-6)
-        rel_sy = (scy - cand.y) / max(cand.h, 1e-6)
-        if 0.0 <= rel_sx <= 1.0 and 0.0 <= rel_sy <= 1.0:
+        if framing_style == "center_subject":
+            eye_line_score = max(0.0, 1.0 - abs(rel_fy - 0.42) * 2.0)
+            horiz_balance = max(0.0, 1.0 - abs(rel_fx - 0.5) * 2.2)
+            composition_score = 0.90 * horiz_balance + 0.55 * eye_line_score
+        else:
+            eye_line_score = max(0.0, 1.0 - abs(rel_fy - 0.35) * 2.2)
+            fx_dist = min(abs(rel_fx - 0.5), abs(rel_fx - 0.333), abs(rel_fx - 0.667))
+            horiz_balance = max(0.0, 1.0 - fx_dist * 2.5)
+            composition_score = 0.40 * eye_line_score + 0.25 * horiz_balance
+    elif subject_in_frame:
+        if framing_style == "center_subject":
+            # Actively center animals / primary subjects inside the crop window
+            dist_center = float(np.hypot(rel_sx - 0.5, rel_sy - 0.5))
+            center_align = max(0.0, 1.0 - dist_center * 1.9)
+            # Strong weight when a neural/animal subject is detected so background foliage
+            # never pulls the crop away from the bird/insect/mammal.
+            weight = 2.40 if analysis.has_strong_subject else 0.95
+            composition_score = weight * center_align
+        else:
             dx_third = min(abs(rel_sx - 0.333), abs(rel_sx - 0.667), abs(rel_sx - 0.5) * 1.15)
             dy_third = min(abs(rel_sy - 0.333), abs(rel_sy - 0.667), abs(rel_sy - 0.5) * 1.15)
             x_align = max(0.0, 1.0 - dx_third * 2.5)
             y_align = max(0.0, 1.0 - dy_third * 2.5)
-            composition_score = 0.22 * (x_align + y_align) * 0.5
+            weight = 1.25 if analysis.has_strong_subject else 0.35
+            composition_score = weight * (x_align + y_align) * 0.5
+    elif analysis.has_strong_subject:
+        # Strongly penalize crops that leave the detected subject center completely outside
+        composition_score = -2.5
 
-    # 6. Mild center bias tie-breaker + slight preference for larger crop area
+    # 6. Mild frame center tie-breaker + slight preference for larger crop area
     center_dist = float(np.hypot(cand.cx - 0.5, cand.cy - 0.5))
-    center_bias = max(0.0, 1.0 - center_dist * 2.0) * 0.06
+    center_bias = max(0.0, 1.0 - center_dist * 2.0) * 0.05
     area_bonus = cand.area * 0.12
 
+    # When a clear animal/subject was detected, let subject protection + framing lead
+    # rather than summing noisy background foliage across the whole image.
+    saliency_weight = 0.85 if analysis.has_strong_subject else 1.35
+
     return (
-        1.35 * saliency_score
+        saliency_weight * saliency_score
         + horizon_score
         + composition_score
         + center_bias
         + area_bonus
-        - face_penalty
+        - subject_clip_penalty
         - border_penalty
     )
+
+
+def _measure_subject_clipping(
+    best_box: CropBox,
+    src_w: int,
+    src_h: int,
+    analysis: SceneAnalysis,
+) -> float:
+    """Compute fraction (0.0..1.0) of detected subject(s) clipped outside best_box."""
+    norm_crop = Box(
+        x=best_box.x / src_w,
+        y=best_box.y / src_h,
+        w=best_box.width / src_w,
+        h=best_box.height / src_h,
+    )
+
+    worst_clipped = 0.0
+    protected: list[Box] = list(analysis.animal_boxes) + list(analysis.faces)
+    if analysis.has_strong_subject and analysis.subject_box is not None:
+        protected.append(analysis.subject_box)
+
+    for subj in protected:
+        clipped = max(0.0, 1.0 - subj.fraction_inside(norm_crop))
+        worst_clipped = max(worst_clipped, clipped)
+
+    # Also measure foreground mask mass cut outside the crop (catches flower petals,
+    # bird wings/tails, or insect antennae directly on the neural mask).
+    fg_mask = analysis.foreground_mask
+    if fg_mask is not None:
+        fh, fw = fg_mask.shape
+        fg_bin = np.where(fg_mask >= 0.25, fg_mask, 0.0)
+        total_fg = float(fg_bin.sum())
+        if total_fg > 1e-6:
+            x1 = max(0, min(fw, int(round(norm_crop.x * fw))))
+            y1 = max(0, min(fh, int(round(norm_crop.y * fh))))
+            x2 = max(x1, min(fw, int(round(norm_crop.x2 * fw))))
+            y2 = max(y1, min(fh, int(round(norm_crop.y2 * fh))))
+            inside_fg = float(fg_bin[y1:y2, x1:x2].sum())
+            mask_clipped = max(0.0, 1.0 - (inside_fg / total_fg))
+            worst_clipped = max(worst_clipped, mask_clipped)
+
+    return worst_clipped
 
 
 def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecision:
@@ -242,7 +314,12 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
             analysis=None,
         )
 
-    analysis = analyze_scene(rgb_image, max_dim=config.analysis_max_dim)
+    analysis = analyze_scene(
+        rgb_image,
+        max_dim=config.analysis_max_dim,
+        use_neural_detector=config.use_neural_detector,
+        auto_download_detectors=config.auto_download_detectors,
+    )
     integral = cv2.integral(analysis.saliency_map.astype(np.float64))
     total_saliency = float(analysis.saliency_map.sum())
 
@@ -287,7 +364,15 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
             w=box.width / src_w,
             h=box.height / src_h,
         )
-        score = _score_candidate(norm_box, analysis, integral, total_saliency, src_w, src_h)
+        score = _score_candidate(
+            norm_box,
+            analysis,
+            integral,
+            total_saliency,
+            src_w,
+            src_h,
+            framing_style=config.framing_style,
+        )
         if score > best_score:
             best_score = score
             best_box = box
@@ -295,6 +380,15 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
     # Build a concise human-readable explanation
     notes: list[str] = []
     horizon_rel: float | None = None
+    if analysis.animal_boxes:
+        labels = sorted({b.label for b in analysis.animal_boxes})
+        top_conf = max(b.score for b in analysis.animal_boxes)
+        notes.append(f"detected {'/'.join(labels)} ({top_conf:.2f})")
+    elif analysis.has_strong_subject and "u2netp_foreground" in analysis.detector_tags:
+        notes.append(
+            f"foreground subject @ ({analysis.primary_center[0]:.0%}, "
+            f"{analysis.primary_center[1]:.0%})"
+        )
     if analysis.faces:
         notes.append(f"{len(analysis.faces)} face(s) protected")
     if analysis.horizon.y_norm is not None and analysis.horizon.confidence >= 0.30:
@@ -312,6 +406,9 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
         f"@ ({best_box.x},{best_box.y})"
     )
 
+    clipped_frac = _measure_subject_clipping(best_box, src_w, src_h, analysis)
+    would_clip = clipped_frac > max(0.0, config.max_subject_clip_fraction)
+
     return CropDecision(
         box=best_box,
         was_cropped=True,
@@ -320,6 +417,8 @@ def compute_smart_crop(rgb_image: np.ndarray, config: CropConfig) -> CropDecisio
         analysis=analysis,
         was_smart_zoomed=was_smart_zoomed,
         horizon_y_ratio=horizon_rel,
+        subject_clipped_fraction=clipped_frac,
+        would_clip_subject=would_clip,
     )
 
 

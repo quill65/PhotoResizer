@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from photo_resizer.config import (
+    DEFAULT_GEMINI_IMAGE_MODEL,
     AspectRatio,
     CropConfig,
     EnhanceConfig,
@@ -93,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to a local .onnx super-resolution model.",
     )
     parser.add_argument(
+        "--gemini-model",
+        default=DEFAULT_GEMINI_IMAGE_MODEL,
+        help=(
+            "Gemini image model ID for AI outpainting/enhancement "
+            f"(default: {DEFAULT_GEMINI_IMAGE_MODEL})."
+        ),
+    )
+    parser.add_argument(
         "--no-auto-download-onnx",
         action="store_true",
         help="Do not download a default ONNX model if none is present locally.",
@@ -110,6 +119,25 @@ def build_parser() -> argparse.ArgumentParser:
             "How to handle portrait <-> landscape orientation mismatches: "
             "crop, match_orientation, blur_fill, or ai_outpaint (default: crop)."
         ),
+    )
+    parser.add_argument(
+        "--framing",
+        choices=["center_subject", "rule_of_thirds"],
+        default="center_subject",
+        help=(
+            "Subject framing style: center_subject (best for wildlife/animals) or "
+            "rule_of_thirds (default: center_subject)."
+        ),
+    )
+    parser.add_argument(
+        "--no-outpaint-on-clip",
+        action="store_true",
+        help="Disable automatic AI outpainting when cropping would clip an animal/flower subject.",
+    )
+    parser.add_argument(
+        "--no-neural-detector",
+        action="store_true",
+        help="Disable local ONNX wildlife/subject detector (YOLO11n + U2-Net-P).",
     )
     parser.add_argument(
         "--overwrite",
@@ -171,7 +199,10 @@ def main(argv: list[str] | None = None) -> int:
         crop=CropConfig(
             aspect_ratio=ratio,
             orientation_mode=args.orientation_mode,
+            framing_style=args.framing,
+            outpaint_on_clip=not args.no_outpaint_on_clip,
             allow_smart_zoom=args.allow_smart_zoom,
+            use_neural_detector=not args.no_neural_detector,
         ),
         enhance=EnhanceConfig(
             enabled=not args.no_enhance,
@@ -180,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             min_short_edge=args.min_short_edge,
             onnx_model_path=args.onnx_model,
             auto_download_onnx=not args.no_auto_download_onnx,
+            gemini_model=args.gemini_model,
         ),
         jpeg_quality=args.quality,
         overwrite=args.overwrite,

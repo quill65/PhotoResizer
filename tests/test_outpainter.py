@@ -1,18 +1,24 @@
 """Tests for mismatched orientation modes: match_orientation, blur_fill, and ai_outpaint."""
 
+import base64
 import io
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import numpy as np
+import pytest
 from PIL import Image
 
 from photo_resizer.config import AspectRatio, CropConfig, EnhanceConfig, ProcessConfig
+from photo_resizer.enhancer import ModelUnavailableError, post_gemini_image_request
 from photo_resizer.outpainter import (
     GeminiOutpainter,
+    align_and_composite_original,
     compute_expanded_canvas_size,
     create_blurred_backdrop,
     is_orientation_mismatch,
+    nearest_gemini_aspect_ratio,
 )
 from photo_resizer.processor import process_folder
 
@@ -87,16 +93,36 @@ def test_match_orientation_flips_ratio_for_portrait(tmp_path: Path) -> None:
     assert "aspect_ratio_crop" in res.change_types
 
 
-def test_ai_outpaint_preserves_original_center_and_logs_gemini_tool(tmp_path: Path) -> None:
+def test_ai_outpaint_preserves_seamless_output_and_aligned_original(tmp_path: Path) -> None:
+    """Verify SIFT alignment composites cleanly when matched and avoids seams when reframed."""
+    assert nearest_gemini_aspect_ratio(16 / 9) == "16:9"
+    assert nearest_gemini_aspect_ratio(4 / 3) == "4:3"
+    assert nearest_gemini_aspect_ratio(9 / 16) == "9:16"
+
+    # Build a textured synthetic portrait (rich features for SIFT) inside a 16:9 canvas
+    rng = np.random.default_rng(123)
+    full_scene = np.full((600, 1066, 3), (50, 120, 60), dtype=np.uint8)
+    for _ in range(80):
+        cx = int(rng.integers(50, 1016))
+        cy = int(rng.integers(50, 550))
+        rad = int(rng.integers(12, 45))
+        color = tuple(int(c) for c in rng.integers(30, 240, size=3))
+        import cv2
+
+        cv2.circle(full_scene, (cx, cy), rad, color, -1)
+
+    # Original portrait is the center 450x600 slice of full_scene
+    orig_arr = full_scene[:, 308:758].copy()
+    portrait = Image.fromarray(orig_arr, mode="RGB")
     src_file = tmp_path / "subject_portrait.png"
-    # Portrait with unique bright yellow color so we verify untouched central compositing
-    portrait = Image.new("RGB", (600, 800), (245, 220, 30))
     portrait.save(src_file)
 
-    # Mock Gemini returning a blue-sky landscape image
-    fake_ai_img = Image.new("RGB", (1280, 720), (60, 150, 230))
+    # 1. Aligned Gemini output (resized to 1280x720) -> SIFT locks & composites seamlessly!
+    aligned_ai = Image.fromarray(full_scene, mode="RGB").resize(
+        (1280, 720), Image.Resampling.LANCZOS
+    )
     buf = io.BytesIO()
-    fake_ai_img.save(buf, format="PNG")
+    aligned_ai.save(buf, format="PNG")
     fake_png = buf.getvalue()
 
     cfg = ProcessConfig(
@@ -109,19 +135,19 @@ def test_ai_outpaint_preserves_original_center_and_logs_gemini_tool(tmp_path: Pa
         summary = process_folder(cfg)
 
     assert mock_api.call_count == 1
+    assert mock_api.call_args.kwargs.get("aspect_ratio") == "16:9"
     assert summary.processed == 1
     res = summary.results[0]
-    assert res.final_size == (1422, 800)
+    assert res.final_size == (1067, 600)
     assert "ai_outpaint_background" in res.change_types
-    assert any("Gemini AI Outpaint" in t for t in res.tools_used)
+    assert any("Aligned Original Composite" in t for t in res.tools_used)
 
-    with Image.open(tmp_path / "corrected" / "subject_portrait.png") as out_img:
-        arr = np.asarray(out_img)
-        # Central original portrait pixels must remain untouched yellow
-        assert np.allclose(arr[400, 711], [245, 220, 30], atol=2)
-        # Outer left/right wings must contain the AI-generated blue background
-        assert np.allclose(arr[400, 40], [60, 150, 230], atol=5)
-        assert np.allclose(arr[400, 1380], [60, 150, 230], atol=5)
+    # 2. Reframed/shifted Gemini output that doesn't match -> must NOT blindly stamp a seam!
+    unaligned_ai = Image.new("RGB", (1280, 720), (60, 150, 230))
+    seamless_out, did_comp = align_and_composite_original(unaligned_ai, portrait, 1067, 600)
+    assert did_comp is False
+    assert seamless_out.size == (1067, 600)
+    assert np.allclose(np.asarray(seamless_out)[300, 533], [60, 150, 230], atol=2)
 
 
 def test_ai_outpaint_without_api_key_falls_back_to_blur_fill(tmp_path: Path) -> None:
@@ -145,3 +171,104 @@ def test_ai_outpaint_without_api_key_falls_back_to_blur_fill(tmp_path: Path) -> 
     assert res.final_size == (1422, 800)
     assert "blurred_backdrop_fill" in res.change_types
     assert "ai_outpaint skipped" in res.message
+
+
+def test_gemini_429_zero_quota_fails_fast_with_clear_billing_message() -> None:
+    zero_quota_resp = httpx.Response(
+        429,
+        json={
+            "error": {
+                "code": 429,
+                "message": (
+                    "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0"
+                ),
+            }
+        },
+    )
+    with (
+        patch("photo_resizer.enhancer.httpx.post", return_value=zero_quota_resp) as mock_post,
+        patch("photo_resizer.enhancer.time.sleep") as mock_sleep,
+        pytest.raises(ModelUnavailableError, match="quota is 0"),
+    ):
+        post_gemini_image_request(
+            "fake-key", "gemini-2.5-flash-image", b"png", "outpaint", min_interval_sec=0.0
+        )
+
+    assert mock_post.call_count == 1
+    assert mock_sleep.call_count == 0
+
+
+def test_gemini_429_transient_rate_limit_retries_and_succeeds() -> None:
+    rate_limit_resp = httpx.Response(
+        429,
+        json={
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted. Please retry in 1s.",
+                "details": [{"retryDelay": "1s"}],
+            }
+        },
+    )
+    ok_resp = httpx.Response(
+        200,
+        json={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": base64.b64encode(b"fake-out-image").decode("ascii"),
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    with (
+        patch("photo_resizer.enhancer.httpx.post", side_effect=[rate_limit_resp, ok_resp]) as mp,
+        patch("photo_resizer.enhancer.time.sleep") as mock_sleep,
+    ):
+        out = post_gemini_image_request(
+            "fake-key", "gemini-2.5-flash-image", b"png", "outpaint", min_interval_sec=0.0
+        )
+
+    assert out == b"fake-out-image"
+    assert mp.call_count == 2
+    assert mock_sleep.call_count == 1
+
+
+def test_gemini_404_falls_back_from_nano_banana_alias_to_31_flash_image() -> None:
+    not_found = httpx.Response(404, json={"error": {"code": 404, "message": "Model not found"}})
+    ok_resp = httpx.Response(
+        200,
+        json={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": base64.b64encode(b"ok-bytes").decode("ascii"),
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    with patch("photo_resizer.enhancer.httpx.post", side_effect=[not_found, ok_resp]) as mp:
+        out = post_gemini_image_request(
+            "fake-key", "gemini-nano-banana-2.1", b"png", "outpaint", min_interval_sec=0.0
+        )
+
+    assert out == b"ok-bytes"
+    assert mp.call_count == 2
+    assert "gemini-3.1-flash-image" in mp.call_args_list[1].args[0]
+
+

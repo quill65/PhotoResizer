@@ -15,6 +15,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from photo_resizer.subject_detector import NeuralSubjectResult, get_wildlife_detector
+
 
 @dataclass(frozen=True)
 class Box:
@@ -83,11 +85,16 @@ class SceneAnalysis:
 
     faces: list[Box] = field(default_factory=list)
     headroom_boxes: list[Box] = field(default_factory=list)
+    animal_boxes: list[Box] = field(default_factory=list)
+    animal_margin_boxes: list[Box] = field(default_factory=list)
     subject_box: Box | None = None
+    foreground_mask: np.ndarray | None = None
     saliency_map: np.ndarray = field(default_factory=lambda: np.ones((1, 1), dtype=np.float32))
     horizon: HorizonEstimate = field(default_factory=lambda: HorizonEstimate(None, 0.0))
     primary_center: tuple[float, float] = (0.5, 0.5)
     proxy_size: tuple[int, int] = (1, 1)
+    detector_tags: list[str] = field(default_factory=list)
+    has_strong_subject: bool = False
 
 
 @lru_cache(maxsize=4)
@@ -418,7 +425,81 @@ def _detect_horizon(
     )
 
 
-def analyze_scene(rgb_image: np.ndarray, max_dim: int = 640) -> SceneAnalysis:
+def _expand_animal_margin(box: Box, pad_frac: float = 0.14) -> Box:
+    """Add protective breathing room around an animal (beak, tail, wings, antennae)."""
+    dx = box.w * pad_frac
+    dy = box.h * pad_frac
+    x1 = max(0.0, box.x - dx)
+    y1 = max(0.0, box.y - dy)
+    x2 = min(1.0, box.x2 + dx)
+    y2 = min(1.0, box.y2 + dy)
+    return Box(x=x1, y=y1, w=x2 - x1, h=y2 - y1, score=box.score, label=f"{box.label}_margin")
+
+
+def _extract_box_from_mask(mask: np.ndarray, threshold: float = 0.25) -> Box | None:
+    """Extract union bounding box covering the full foreground subject (petals, tails, wings)."""
+    h, w = mask.shape
+    binary = (mask >= threshold).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+    components: list[tuple[float, int, int, int, int]] = []
+    min_area = max(16, int(w * h * 0.002))
+    for idx in range(1, num_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        mass = float(mask[labels == idx].sum())
+        bx = int(stats[idx, cv2.CC_STAT_LEFT])
+        by = int(stats[idx, cv2.CC_STAT_TOP])
+        bw = int(stats[idx, cv2.CC_STAT_WIDTH])
+        bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        components.append((mass, bx, by, bx + bw, by + bh))
+
+    if not components:
+        return None
+
+    # Keep primary foreground component plus any secondary parts (e.g. separated petals,
+    # wingtips, tails, or a second animal) with >=15% of the primary mass.
+    components.sort(key=lambda item: item[0], reverse=True)
+    primary_mass = components[0][0]
+    kept = [c for c in components if c[0] >= primary_mass * 0.15]
+
+    min_x = min(c[1] for c in kept)
+    min_y = min(c[2] for c in kept)
+    max_x = max(c[3] for c in kept)
+    max_y = max(c[4] for c in kept)
+    return Box(
+        min_x / w,
+        min_y / h,
+        (max_x - min_x) / w,
+        (max_y - min_y) / h,
+        score=1.0,
+        label="foreground_subject",
+    )
+
+
+def _mask_centroid(mask: np.ndarray, floor: float = 0.25) -> tuple[float, float] | None:
+    """Compute normalized (cx, cy) centroid over salient pixels above floor."""
+    h, w = mask.shape
+    weights = np.where(mask >= floor, mask, 0.0).astype(np.float32)
+    total = float(weights.sum())
+    if total <= 1e-6:
+        return None
+    ys, xs = np.indices((h, w), dtype=np.float32)
+    cx = float((weights * xs).sum() / total) / w
+    cy = float((weights * ys).sum() / total) / h
+    return (cx, cy)
+
+
+def analyze_scene(
+    rgb_image: np.ndarray,
+    max_dim: int = 640,
+    *,
+    use_neural_detector: bool = True,
+    auto_download_detectors: bool = True,
+) -> SceneAnalysis:
     """Run offline CV/ML scene analysis on an RGB uint8 numpy image."""
     orig_h, orig_w = rgb_image.shape[:2]
     scale = min(1.0, max_dim / max(orig_w, orig_h))
@@ -432,25 +513,125 @@ def analyze_scene(rgb_image: np.ndarray, max_dim: int = 640) -> SceneAnalysis:
 
     faces = _detect_faces(proxy)
     headroom_boxes = [_expand_face_to_headroom(face) for face in faces]
-    saliency = _compute_saliency_map(proxy, faces, headroom_boxes)
-    subject_box = _extract_subject_box(saliency, faces)
-    horizon = _detect_horizon(proxy, saliency, faces)
+    classical_saliency = _compute_saliency_map(proxy, faces, headroom_boxes)
 
-    # Saliency center of mass
-    total_mass = float(saliency.sum())
-    if total_mass > 1e-6:
-        ys, xs = np.indices((proxy_h, proxy_w), dtype=np.float32)
-        cx = float((saliency * xs).sum() / total_mass) / proxy_w
-        cy = float((saliency * ys).sum() / total_mass) / proxy_h
+    # Run offline neural wildlife & foreground subject detector (YOLO11n + U2-Net-P)
+    neural = NeuralSubjectResult()
+    if use_neural_detector:
+        detector = get_wildlife_detector(auto_download=auto_download_detectors)
+        neural = detector.detect(proxy, (proxy_w, proxy_h))
+
+    animal_boxes = [
+        Box(a.x, a.y, a.w, a.h, score=a.score, label=a.label) for a in neural.animals
+    ]
+    # If no animals or Haar faces were found, protect YOLO person detections as subjects too
+    if not animal_boxes and not faces and neural.people:
+        animal_boxes = [
+            Box(p.x, p.y, p.w, p.h, score=p.score, label=p.label) for p in neural.people
+        ]
+    animal_margin_boxes = [_expand_animal_margin(b) for b in animal_boxes]
+
+    # Blend neural foreground mask & animal detections into saliency map so busy
+    # background foliage/branches never overpower the actual animal.
+    saliency = classical_saliency
+    fg_mask = neural.foreground_mask
+    if fg_mask is not None:
+        saliency = _normalize_map(0.78 * fg_mask + 0.22 * classical_saliency)
+
+    if animal_boxes:
+        animal_boost = np.zeros((proxy_h, proxy_w), dtype=np.float32)
+        for box in animal_boxes:
+            x1, y1 = int(box.x * proxy_w), int(box.y * proxy_h)
+            x2, y2 = int(np.ceil(box.x2 * proxy_w)), int(np.ceil(box.y2 * proxy_h))
+            animal_boost[y1:y2, x1:x2] = np.maximum(
+                animal_boost[y1:y2, x1:x2], min(1.0, 0.75 + 0.25 * box.score)
+            )
+        animal_boost = cv2.GaussianBlur(animal_boost, (15, 15), 0)
+        saliency = _normalize_map(0.30 * saliency + 0.85 * animal_boost)
+
+    # Determine primary subject bounding box and subject center
+    subject_box: Box | None = None
+    has_strong_subject = False
+
+    fg_box = _extract_box_from_mask(fg_mask, threshold=0.25) if fg_mask is not None else None
+    valid_fg_box = fg_box if (fg_box is not None and 0.004 <= fg_box.area <= 0.92) else None
+
+    if animal_boxes:
+        has_strong_subject = True
+        boxes_for_union = list(animal_boxes)
+        # Union with overlapping foreground mask so long tails, wings, or flowers
+        # touching the animal are never clipped off by a tight YOLO box.
+        if valid_fg_box is not None and any(
+            valid_fg_box.intersection_area(ab) > 0.0 for ab in animal_boxes
+        ):
+            boxes_for_union.append(valid_fg_box)
+        min_x = min(b.x for b in boxes_for_union)
+        min_y = min(b.y for b in boxes_for_union)
+        max_x = max(b.x2 for b in boxes_for_union)
+        max_y = max(b.y2 for b in boxes_for_union)
+        subject_box = Box(min_x, min_y, max_x - min_x, max_y - min_y, score=1.0, label="animal")
+    elif valid_fg_box is not None:
+        subject_box = valid_fg_box
+        has_strong_subject = True
+    if subject_box is None:
+        subject_box = _extract_subject_box(saliency, faces)
+        if faces:
+            has_strong_subject = True
+
+    # Suppress false background horizons when a prominent animal or foreground subject is found
+    # (prevents horizontal branches/waterlines from pulling birds or insects off-center).
+    large_fg = subject_box is not None and subject_box.area >= 0.03
+    if has_strong_subject and (animal_boxes or large_fg):
+        horizon = HorizonEstimate(y_norm=None, confidence=0.0)
     else:
-        cx, cy = 0.5, 0.5
+        horizon = _detect_horizon(proxy, saliency, faces)
+
+    # Compute subject-anchored center rather than background-diluted global average
+    if animal_boxes:
+        weights = [max(0.1, b.score) * float(np.sqrt(max(b.area, 1e-4))) for b in animal_boxes]
+        w_sum = sum(weights)
+        cx = sum(b.cx * wt for b, wt in zip(animal_boxes, weights, strict=True)) / w_sum
+        cy = sum(b.cy * wt for b, wt in zip(animal_boxes, weights, strict=True)) / w_sum
+    elif fg_mask is not None and has_strong_subject:
+        centroid = _mask_centroid(fg_mask, floor=0.30)
+        if centroid is not None:
+            cx, cy = centroid
+        elif subject_box is not None:
+            cx, cy = subject_box.cx, subject_box.cy
+        else:
+            cx, cy = 0.5, 0.5
+    elif faces:
+        cx = sum(f.cx for f in faces) / len(faces)
+        cy = sum(f.cy for f in faces) / len(faces)
+    elif subject_box is not None:
+        # Weight toward the primary subject cluster instead of uniform background noise
+        bx1 = int(subject_box.x * proxy_w)
+        by1 = int(subject_box.y * proxy_h)
+        bx2 = max(bx1 + 1, int(np.ceil(subject_box.x2 * proxy_w)))
+        by2 = max(by1 + 1, int(np.ceil(subject_box.y2 * proxy_h)))
+        sub = saliency[by1:by2, bx1:bx2]
+        sub_mass = float(sub.sum())
+        if sub_mass > 1e-6:
+            ys, xs = np.indices(sub.shape, dtype=np.float32)
+            cx = (bx1 + float((sub * xs).sum() / sub_mass)) / proxy_w
+            cy = (by1 + float((sub * ys).sum() / sub_mass)) / proxy_h
+        else:
+            cx, cy = subject_box.cx, subject_box.cy
+    else:
+        centroid = _mask_centroid(saliency, floor=0.20)
+        cx, cy = centroid if centroid is not None else (0.5, 0.5)
 
     return SceneAnalysis(
         faces=faces,
         headroom_boxes=headroom_boxes,
+        animal_boxes=animal_boxes,
+        animal_margin_boxes=animal_margin_boxes,
         subject_box=subject_box,
+        foreground_mask=fg_mask,
         saliency_map=saliency,
         horizon=horizon,
         primary_center=(cx, cy),
         proxy_size=(proxy_w, proxy_h),
+        detector_tags=neural.detector_tags,
+        has_strong_subject=has_strong_subject,
     )

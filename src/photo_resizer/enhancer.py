@@ -11,7 +11,9 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -22,7 +24,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-from photo_resizer.config import EnhanceConfig
+from photo_resizer.config import DEFAULT_GEMINI_IMAGE_MODEL, EnhanceConfig
 
 DEFAULT_ONNX_MODEL_NAME = "realesr-general-x4v3.onnx"
 DEFAULT_ONNX_MODEL_URLS: tuple[str, ...] = (
@@ -392,16 +394,219 @@ class OnnxSuperResEnhancer:
         return result
 
 
+_LAST_GEMINI_CALL_MONOTONIC: float = 0.0
+_MIN_GEMINI_INTERVAL_SEC: float = 1.5
+_GEMINI_404_FALLBACK_MODELS: dict[str, tuple[str, ...]] = {
+    "gemini-nano-banana-2.1": (
+        "gemini-3.1-flash-image",
+        "gemini-3.1-flash-image-preview",
+    ),
+}
+
+
+def _parse_gemini_error(resp: httpx.Response) -> tuple[str, bool, float | None]:
+    """Extract (human_message, is_zero_quota, retry_delay_sec) from a Gemini error response."""
+    detail_msg = ""
+    retry_delay: float | None = None
+    is_zero_quota = False
+
+    try:
+        body = resp.json()
+        err = body.get("error", {}) if isinstance(body, dict) else {}
+        if isinstance(err, dict):
+            detail_msg = str(err.get("message") or "").strip()
+            for item in err.get("details", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                if "retryDelay" in item:
+                    m = re.search(r"(\d+(?:\.\d+)?)", str(item["retryDelay"]))
+                    if m:
+                        retry_delay = float(m.group(1))
+                for viol in item.get("violations", []) or []:
+                    if isinstance(viol, dict):
+                        quota_val = str(viol.get("quotaValue", ""))
+                        if quota_val == "0":
+                            is_zero_quota = True
+    except Exception:
+        detail_msg = resp.text[:300].strip()
+
+    lower_msg = detail_msg.lower()
+    if "limit: 0" in lower_msg or "free_tier" in lower_msg and "limit: 0" in lower_msg:
+        is_zero_quota = True
+
+    if retry_delay is None:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                retry_delay = float(retry_after)
+            except ValueError:
+                pass
+        if retry_delay is None:
+            m = re.search(r"retry in\s+(\d+(?:\.\d+)?)\s*s", lower_msg)
+            if m:
+                retry_delay = float(m.group(1))
+
+    return detail_msg, is_zero_quota, retry_delay
+
+
+def _post_gemini_single_model(
+    api_key: str,
+    model: str,
+    png_bytes: bytes,
+    prompt: str,
+    *,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+    max_retries: int = 3,
+    min_interval_sec: float = _MIN_GEMINI_INTERVAL_SEC,
+) -> tuple[bytes | None, int, str]:
+    """Attempt generateContent against one Gemini model.
+
+    Returns (image_bytes, status_code, error_message). Raises ModelUnavailableError on
+    terminal errors except 404 (returned so caller may try alias fallbacks).
+    """
+    global _LAST_GEMINI_CALL_MONOTONIC
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gen_config: dict[str, object] = {"responseModalities": ["IMAGE"]}
+    image_cfg: dict[str, str] = {}
+    if aspect_ratio:
+        image_cfg["aspectRatio"] = aspect_ratio
+    if image_size:
+        image_cfg["imageSize"] = image_size
+    if image_cfg:
+        gen_config["imageConfig"] = image_cfg
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64.b64encode(png_bytes).decode("ascii"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": gen_config,
+    }
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+
+    last_error = ""
+    for attempt in range(max_retries + 1):
+        # Pace consecutive calls in batch runs to stay below RPM limits
+        now = time.monotonic()
+        elapsed = now - _LAST_GEMINI_CALL_MONOTONIC
+        if min_interval_sec > 0 and _LAST_GEMINI_CALL_MONOTONIC > 0 and elapsed < min_interval_sec:
+            time.sleep(min_interval_sec - elapsed)
+        _LAST_GEMINI_CALL_MONOTONIC = time.monotonic()
+
+        try:
+            resp = httpx.post(url, headers=headers, json=payload, timeout=90.0)
+        except Exception as exc:
+            raise ModelUnavailableError(f"Gemini API network error: {exc}") from exc
+
+        if resp.status_code == 200:
+            data = resp.json()
+            for candidate in data.get("candidates", []):
+                parts = candidate.get("content", {}).get("parts", [])
+                for part in parts:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        return base64.b64decode(inline["data"]), 200, ""
+            raise ModelUnavailableError("Gemini API response did not include an image")
+
+        detail_msg, is_zero_quota, retry_delay = _parse_gemini_error(resp)
+
+        # If a specific model doesn't accept imageSize (e.g. legacy models), strip it and retry once
+        if resp.status_code == 400 and image_cfg.get("imageSize"):
+            image_cfg.pop("imageSize", None)
+            if not image_cfg:
+                gen_config.pop("imageConfig", None)
+            continue
+
+        if resp.status_code == 404:
+            return None, 404, detail_msg or f"Model '{model}' not found (HTTP 404)"
+
+        if resp.status_code == 429:
+            if is_zero_quota:
+                raise ModelUnavailableError(
+                    f"Gemini image quota is 0 for '{model}' (Free Tier does not include image "
+                    "generation—link a billing account to your project in Google AI Studio -> "
+                    "API keys)"
+                )
+            if attempt < max_retries:
+                wait_sec = min(30.0, retry_delay if retry_delay is not None else 2.0 * (2**attempt))
+                time.sleep(max(0.5, wait_sec))
+                continue
+            short_detail = f": {detail_msg[:180]}" if detail_msg else ""
+            raise ModelUnavailableError(
+                f"Gemini rate limit exceeded (429 after {max_retries + 1} attempts){short_detail}"
+            )
+
+        if resp.status_code in (500, 502, 503, 504) and attempt < max_retries:
+            time.sleep(2.0 * (2**attempt))
+            continue
+
+        last_error = f"HTTP {resp.status_code}"
+        if detail_msg:
+            last_error += f": {detail_msg[:220]}"
+        raise ModelUnavailableError(f"Gemini API error ({last_error})")
+
+    raise ModelUnavailableError(f"Gemini API request failed ({last_error or 'unknown error'})")
+
+
+def post_gemini_image_request(
+    api_key: str,
+    model: str,
+    png_bytes: bytes,
+    prompt: str,
+    *,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+    max_retries: int = 3,
+    min_interval_sec: float = _MIN_GEMINI_INTERVAL_SEC,
+) -> bytes:
+    """Call Gemini generateContent for image output with pacing, backoff, and 404 alias fallback."""
+    candidates = [model, *_GEMINI_404_FALLBACK_MODELS.get(model, ())]
+    last_404 = ""
+    for cand_model in candidates:
+        img_bytes, status, err = _post_gemini_single_model(
+            api_key=api_key,
+            model=cand_model,
+            png_bytes=png_bytes,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            max_retries=max_retries,
+            min_interval_sec=min_interval_sec,
+        )
+        if img_bytes is not None:
+            return img_bytes
+        if status == 404:
+            last_404 = err
+            continue
+
+    raise ModelUnavailableError(
+        f"Gemini image model '{model}' not available ({last_404 or 'HTTP 404'})"
+    )
+
+
 class GeminiEnhancer:
     """Optional cloud AI photographic enhancer via Gemini API.
 
     Only called when explicitly requested or opted into AND GEMINI_API_KEY is available.
-    Uses the `google-genai` SDK if installed, otherwise calls the REST API via `httpx`.
     """
 
     name = "gemini"
 
-    def __init__(self, api_key: str | None, model: str = "gemini-2.5-flash-image") -> None:
+    def __init__(self, api_key: str | None, model: str = DEFAULT_GEMINI_IMAGE_MODEL) -> None:
         self._api_key = api_key
         self._model = model
 
@@ -429,50 +634,12 @@ class GeminiEnhancer:
         return out
 
     def _call_gemini_rest(self, png_bytes: bytes, prompt: str) -> bytes:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._model}:generateContent"
+        return post_gemini_image_request(
+            api_key=self._api_key or "",
+            model=self._model,
+            png_bytes=png_bytes,
+            prompt=prompt,
         )
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": base64.b64encode(png_bytes).decode("ascii"),
-                            }
-                        },
-                    ]
-                }
-            ],
-            "generationConfig": {"responseModalities": ["IMAGE"]},
-        }
-
-        try:
-            resp = httpx.post(
-                url,
-                headers={
-                    "x-goog-api-key": self._api_key or "",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=90.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            raise ModelUnavailableError(f"Gemini API request failed: {exc}") from exc
-
-        for candidate in data.get("candidates", []):
-            parts = candidate.get("content", {}).get("parts", [])
-            for part in parts:
-                inline = part.get("inlineData") or part.get("inline_data")
-                if inline and inline.get("data"):
-                    return base64.b64decode(inline["data"])
-
-        raise ModelUnavailableError("Gemini API response did not include an enhanced image")
 
 
 class TieredEnhancer:

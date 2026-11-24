@@ -229,34 +229,75 @@ def process_folder(
                     change_types.append("orientation_matched")
 
                 framed_img, crop_decision = crop_pil_image(oriented, effective_crop_cfg)
-                was_cropped = crop_decision.was_cropped
-                box = crop_decision.box
-                crop_box_tuple = (box.x, box.y, box.width, box.height)
                 faces_count = (
                     len(crop_decision.analysis.faces)
                     if crop_decision.analysis is not None
                     else 0
                 )
                 horizon_rel = crop_decision.horizon_y_ratio
-                framing_note = crop_decision.reason
-                if mismatched and orient_mode == "match_orientation":
-                    framing_note = (
-                        f"matched orientation ({effective_crop_cfg.aspect_ratio.display_name}); "
-                        f"{framing_note}"
+
+                # Record offline detector tools whenever scene analysis ran
+                if crop_decision.analysis is not None and crop_decision.analysis.detector_tags:
+                    tools_used.append(
+                        "ONNX Wildlife Detector ("
+                        + ", ".join(crop_decision.analysis.detector_tags)
+                        + ")"
                     )
 
-                if crop_decision.was_cropped:
-                    change_types.append("aspect_ratio_crop")
-                    if crop_decision.was_smart_zoomed:
-                        change_types.append("smart_zoom_reframe")
-                    signals: list[str] = []
-                    if faces_count > 0:
-                        signals.append("haar_faces")
-                    signals.append("spectral+lab_saliency")
-                    if horizon_rel is not None:
-                        signals.append("hough_horizon")
-                    tools_used.append(f"OpenCV Scene Analyzer ({', '.join(signals)})")
-                    tools_used.append("Pillow (crop)")
+                # If cropping would slice off part of a detected animal, flower, or face,
+                # expand the canvas via AI outpainting (with offline blur-fill fallback)
+                # instead of clipping the subject!
+                if (
+                    crop_decision.was_cropped
+                    and crop_decision.would_clip_subject
+                    and config.crop.outpaint_on_clip
+                ):
+                    subj_center = (
+                        crop_decision.analysis.primary_center
+                        if (
+                            crop_decision.analysis is not None
+                            and config.crop.framing_style == "center_subject"
+                        )
+                        else None
+                    )
+                    clip_pct = crop_decision.subject_clipped_fraction
+                    expanded = expand_canvas_ai_outpaint(
+                        oriented,
+                        effective_ratio_val,
+                        config.enhance,
+                        subject_center=subj_center,
+                        reason_prefix=f"subject clip avoided ({clip_pct:.0%} would be cut)",
+                    )
+                    framed_img = expanded.image
+                    was_cropped = False
+                    crop_box_tuple = None
+                    if expanded.method == "ai_outpaint":
+                        change_types.append("ai_outpaint_avoid_clip")
+                    else:
+                        change_types.append("blurred_backdrop_avoid_clip")
+                    tools_used.append(expanded.tool_detail)
+                    framing_note = expanded.note
+                else:
+                    was_cropped = crop_decision.was_cropped
+                    box = crop_decision.box
+                    crop_box_tuple = (box.x, box.y, box.width, box.height)
+                    framing_note = crop_decision.reason
+                    if mismatched and orient_mode == "match_orientation":
+                        ratio_name = effective_crop_cfg.aspect_ratio.display_name
+                        framing_note = f"matched orientation ({ratio_name}); {framing_note}"
+
+                    if crop_decision.was_cropped:
+                        change_types.append("aspect_ratio_crop")
+                        if crop_decision.was_smart_zoomed:
+                            change_types.append("smart_zoom_reframe")
+                        signals: list[str] = []
+                        if faces_count > 0:
+                            signals.append("haar_faces")
+                        signals.append("spectral+lab_saliency")
+                        if horizon_rel is not None:
+                            signals.append("hough_horizon")
+                        tools_used.append(f"OpenCV Scene Analyzer ({', '.join(signals)})")
+                        tools_used.append("Pillow (crop)")
 
             cropped_size = framed_img.size
 

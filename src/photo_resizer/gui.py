@@ -12,6 +12,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from photo_resizer.config import (
     ASPECT_RATIO_PRESETS,
+    DEFAULT_GEMINI_IMAGE_MODEL,
+    GEMINI_IMAGE_MODEL_PRESETS,
     AspectRatio,
     CropConfig,
     EnhanceConfig,
@@ -28,6 +30,12 @@ ORIENTATION_MODE_LABELS: dict[str, str] = {
     "AI outpaint background (Gemini)": "ai_outpaint",
 }
 ORIENTATION_CODE_TO_LABEL: dict[str, str] = {v: k for k, v in ORIENTATION_MODE_LABELS.items()}
+
+FRAMING_STYLE_LABELS: dict[str, str] = {
+    "Center subject (best for wildlife)": "center_subject",
+    "Rule of thirds (artistic / landscape)": "rule_of_thirds",
+}
+FRAMING_CODE_TO_LABEL: dict[str, str] = {v: k for k, v in FRAMING_STYLE_LABELS.items()}
 
 HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
@@ -61,10 +69,22 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "are kept without cropping.",
             ),
             (
-                "How Scene Analysis Works (100% Offline)",
-                "Uses local OpenCV + NumPy CV/ML (zero cloud AI): detects faces & headroom so "
-                "heads aren't clipped, maps foreground subject saliency, and aligns detected "
-                "horizons near the ideal rule-of-thirds line.",
+                "How Scene Analysis Works (100% Offline ML)",
+                "Uses local ONNX Runtime + OpenCV (zero cloud AI):\n"
+                "  • Wildlife & Subject Detector (YOLO11n + U2-Net-P): Detects birds, mammals, "
+                "and segments ANY foreground subject (insects, spiders, frogs, deer, squirrels, "
+                "flowers) cleanly away from busy leaves, branches, or grass.\n"
+                "  • Face & Headroom Protection: Detects human faces so heads aren't clipped.\n"
+                "  • Horizon Alignment: Places landscape horizons near the ideal rule-of-thirds "
+                "line when no close subject dominates.",
+            ),
+            (
+                "Subject Framing",
+                "• Center subject (best for wildlife): Actively centers detected birds, insects, "
+                "mammals, or foreground subjects inside the crop window while protecting wings, "
+                "beaks, tails, and antennae from clipping.\n"
+                "• Rule of thirds (artistic / landscape): Aligns subjects near 1/3 or 2/3 power "
+                "points instead of dead center.",
             ),
             (
                 "Skip images already in corrected folder",
@@ -75,6 +95,16 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "Include subfolders",
                 "When checked, scans nested subdirectories inside the source folder and mirrors "
                 "their folder structure in the output folder.",
+            ),
+            (
+                "Outpaint instead of clipping subjects (AI)",
+                "When checked (default), if cropping any photo (even landscape -> landscape, e.g. "
+                "4:3 -> 16:9) would clip more than 3% of a detected animal, flower, or face, the "
+                "app automatically keeps your entire original photo intact and expands the "
+                "background via Gemini AI outpainting instead of cropping—centering the subject "
+                "and feather-compositing your untouched original pixels back in. Photos where the "
+                "subject fits cleanly still crop 100% offline with zero AI calls. Falls back to "
+                "blurred backdrop fill if no Gemini API key is set.",
             ),
             (
                 "Allow smart zoom reframing (up to 15%)",
@@ -179,18 +209,21 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ),
             (
                 "Step 4 — Check Billing / Quotas for Image Models",
-                "Google AI Studio offers a free tier for basic testing, but image-output models "
-                "(like gemini-2.5-flash-image) often have strict free limits or require linking "
-                "a billing account. In AI Studio's 'API keys' or 'Billing' page, link a payment "
-                "method if you see quota/billing errors—you only pay per image enhanced.",
+                "Google AI Studio offers a free tier for basic text testing, but image-output "
+                "models (like Nano Banana 2.1 / gemini-nano-banana-2.1 and "
+                "gemini-3.1-flash-image) often require linking a billing account (otherwise "
+                "Google returns HTTP 429 with quota limit 0). In AI Studio's 'API keys' or "
+                "'Billing' page, link a payment method to unlock Tier 1—you only pay per image "
+                "outpainted or enhanced.",
             ),
             (
                 "Step 5 — Enter the Key in Photo Resizer",
                 "Keep your API key private (treat it like a password). Paste it into the "
-                "'Gemini API Key' box in this window and set Enhancer Tier to 'gemini'. To avoid "
-                "pasting it every time, save it in Windows PowerShell with:\n"
-                "  setx GEMINI_API_KEY \"your-api-key-here\"\n"
-                "and restart the app so it auto-fills automatically.",
+                "'Gemini API Key' box in this window—the app automatically remembers and "
+                "auto-fills your last API key on future launches (encrypted with Windows user "
+                "account protection). You can also set the GEMINI_API_KEY environment variable "
+                "for CLI runs:\n"
+                "  setx GEMINI_API_KEY \"your-api-key-here\"",
             ),
         ),
     ),
@@ -232,17 +265,24 @@ class PhotoResizerApp:
             saved.orientation_mode, "Crop to target ratio"
         )
         self.orientation_mode_var = tk.StringVar(value=orient_label)
+        framing_label = FRAMING_CODE_TO_LABEL.get(
+            saved.framing_style, "Center subject (best for wildlife)"
+        )
+        self.framing_style_var = tk.StringVar(value=framing_label)
 
         self.skip_existing_var = tk.BooleanVar(value=saved.skip_existing)
         self.recursive_var = tk.BooleanVar(value=saved.recursive)
         self.smart_zoom_var = tk.BooleanVar(value=saved.allow_smart_zoom)
+        self.outpaint_on_clip_var = tk.BooleanVar(value=saved.outpaint_on_clip)
 
         self.enhance_enabled_var = tk.BooleanVar(value=saved.enhance_enabled)
         self.enhancer_mode_var = tk.StringVar(value=saved.enhancer_mode)
         self.min_long_var = tk.IntVar(value=saved.min_long_edge)
         self.min_short_var = tk.IntVar(value=saved.min_short_edge)
         self.onnx_model_var = tk.StringVar(value=saved.onnx_model_path)
-        self.gemini_key_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
+        initial_api_key = saved.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
+        self.gemini_key_var = tk.StringVar(value=initial_api_key)
+        self.gemini_model_var = tk.StringVar(value=saved.gemini_model)
         self.save_log_var = tk.BooleanVar(value=saved.save_log)
         self.log_format_var = tk.StringVar(value=saved.log_format)
 
@@ -330,24 +370,40 @@ class PhotoResizerApp:
             textvariable=self.orientation_mode_var,
             values=list(ORIENTATION_MODE_LABELS.keys()),
             state="readonly",
-            width=34,
-        ).grid(row=1, column=1, columnspan=3, sticky=tk.W, pady=4)
+            width=30,
+        ).grid(row=1, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(crop_frame, text="Subject Framing:").grid(
+            row=1, column=2, sticky=tk.W, padx=(16, 6), pady=4
+        )
+        ttk.Combobox(
+            crop_frame,
+            textvariable=self.framing_style_var,
+            values=list(FRAMING_STYLE_LABELS.keys()),
+            state="readonly",
+            width=30,
+        ).grid(row=1, column=3, sticky=tk.W, pady=4)
 
         opts_row = ttk.Frame(crop_frame)
         opts_row.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
         ttk.Checkbutton(
             opts_row,
+            text="Outpaint instead of clipping subjects (AI)",
+            variable=self.outpaint_on_clip_var,
+        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            opts_row,
             text="Skip images already in corrected folder",
             variable=self.skip_existing_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+        ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
             opts_row,
             text="Include subfolders",
             variable=self.recursive_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+        ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
             opts_row,
-            text="Allow smart zoom reframing (up to 15%)",
+            text="Allow smart zoom (15%)",
             variable=self.smart_zoom_var,
         ).pack(side=tk.LEFT)
 
@@ -408,11 +464,17 @@ class PhotoResizerApp:
             row=4, column=0, sticky=tk.W, padx=(0, 6), pady=4
         )
         ttk.Entry(enh_frame, textvariable=self.gemini_key_var, show="*").grid(
-            row=4, column=1, columnspan=2, sticky=tk.EW, pady=4
+            row=4, column=1, sticky=tk.EW, pady=4
         )
-        ttk.Label(enh_frame, text="(Used for Gemini tier or AI outpaint)").grid(
-            row=4, column=3, sticky=tk.W, padx=(8, 0), pady=4
+        ttk.Label(enh_frame, text="Gemini Model:").grid(
+            row=4, column=2, sticky=tk.W, padx=(12, 6), pady=4
         )
+        ttk.Combobox(
+            enh_frame,
+            textvariable=self.gemini_model_var,
+            values=list(GEMINI_IMAGE_MODEL_PRESETS),
+            width=28,
+        ).grid(row=4, column=3, sticky=tk.EW, pady=4)
 
         log_opt_row = ttk.Frame(enh_frame)
         log_opt_row.grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(6, 0))
@@ -539,6 +601,10 @@ class PhotoResizerApp:
             orientation_mode=ORIENTATION_MODE_LABELS.get(
                 self.orientation_mode_var.get(), "crop"
             ),
+            framing_style=FRAMING_STYLE_LABELS.get(
+                self.framing_style_var.get(), "center_subject"
+            ),
+            outpaint_on_clip=self.outpaint_on_clip_var.get(),
             skip_existing=self.skip_existing_var.get(),
             recursive=self.recursive_var.get(),
             allow_smart_zoom=self.smart_zoom_var.get(),
@@ -547,6 +613,8 @@ class PhotoResizerApp:
             min_long_edge=min_long,
             min_short_edge=min_short,
             onnx_model_path=self.onnx_model_var.get().strip(),
+            gemini_api_key=self.gemini_key_var.get().strip(),
+            gemini_model=self.gemini_model_var.get().strip() or DEFAULT_GEMINI_IMAGE_MODEL,
             save_log=self.save_log_var.get(),
             log_format=self.log_format_var.get(),
             window_geometry=self.root.winfo_geometry(),
@@ -609,6 +677,10 @@ class PhotoResizerApp:
                 orientation_mode=ORIENTATION_MODE_LABELS.get(
                     self.orientation_mode_var.get(), "crop"
                 ),  # type: ignore[arg-type]
+                framing_style=FRAMING_STYLE_LABELS.get(
+                    self.framing_style_var.get(), "center_subject"
+                ),  # type: ignore[arg-type]
+                outpaint_on_clip=self.outpaint_on_clip_var.get(),
                 allow_smart_zoom=self.smart_zoom_var.get(),
             ),
             enhance=EnhanceConfig(
@@ -618,6 +690,7 @@ class PhotoResizerApp:
                 min_short_edge=int(self.min_short_var.get()),
                 onnx_model_path=onnx_path,
                 gemini_api_key=gemini_key,
+                gemini_model=self.gemini_model_var.get().strip() or DEFAULT_GEMINI_IMAGE_MODEL,
             ),
             overwrite=not self.skip_existing_var.get(),
             recursive=self.recursive_var.get(),

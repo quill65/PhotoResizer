@@ -33,7 +33,9 @@ def test_off_center_subject_is_preserved_in_crop() -> None:
     cv2.circle(img, (1000, 300), 70, (220, 40, 40), 12)
     cv2.rectangle(img, (945, 245), (1055, 355), (255, 255, 255), 6)
 
-    decision = compute_smart_crop(img, CropConfig(aspect_ratio=AspectRatio(1, 1)))
+    decision = compute_smart_crop(
+        img, CropConfig(aspect_ratio=AspectRatio(1, 1), use_neural_detector=False)
+    )
     assert decision.was_cropped is True
     assert decision.box.width == 600
     assert decision.box.height == 600
@@ -57,12 +59,14 @@ def test_landscape_horizon_detection_and_thirds_framing() -> None:
     noise = rng.integers(-35, 36, size=ground.shape, dtype=np.int16)
     img[horizon_y:, :] = np.clip(ground.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
-    analysis = analyze_scene(img, max_dim=450)
+    analysis = analyze_scene(img, max_dim=450, use_neural_detector=False)
     assert analysis.horizon.y_norm is not None
     assert analysis.horizon.y_norm == pytest.approx(horizon_y / h, abs=0.06)
 
     # Crop square landscape into 16:9 widescreen -> vertical crop height ~506px
-    decision = compute_smart_crop(img, CropConfig(aspect_ratio=AspectRatio(16, 9)))
+    decision = compute_smart_crop(
+        img, CropConfig(aspect_ratio=AspectRatio(16, 9), use_neural_detector=False)
+    )
     assert decision.was_cropped is True
     rel_horizon = (horizon_y - decision.box.y) / decision.box.height
     # Horizon should stay well inside the frame, near upper third (~0.25..0.55)
